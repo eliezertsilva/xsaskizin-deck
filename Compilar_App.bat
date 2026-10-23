@@ -2,6 +2,7 @@
 chcp 65001 >nul
 title Compilar xSaskizin Deck
 cd /d "%~dp0"
+set EAS_NO_VCS=1
 echo.
 echo  [1/4] Instalando dependencias (pode demorar uns minutos)...
 call npm install

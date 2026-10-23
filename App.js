@@ -1,8 +1,9 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
 import {
   Alert, Animated, AppState, KeyboardAvoidingView, Modal, Platform, Pressable,
-  ScrollView, StyleSheet, Text, TextInput, View,
+  ScrollView, StyleSheet, Text, TextInput, View, useWindowDimensions,
 } from 'react-native';
+import { CameraView, useCameraPermissions } from 'expo-camera';
 import { StatusBar } from 'expo-status-bar';
 import { useKeepAwake } from 'expo-keep-awake';
 import * as Haptics from 'expo-haptics';
@@ -17,6 +18,18 @@ const C = {
   cream: '#F4E4BE', mut: '#9c8d6d', ok: '#6fbf73', off: '#3a1d17',
 };
 
+// Largura dos botões conforme a orientação (2 colunas em pé, 4-5 deitado).
+const ColsCtx = createContext('47%');
+
+// QR do OBS: obsws://IP:PORTA/SENHA
+export function parseObsQr(data) {
+  const m = /^obsws:\/\/([^:/?#]+)(?::(\d+))?(?:\/(.*))?$/i.exec(String(data || '').trim());
+  if (!m) return null;
+  let pass = m[3] || '';
+  try { pass = decodeURIComponent(pass); } catch (e) {}
+  return { host: m[1], port: parseInt(m[2] || '4455', 10), pass };
+}
+
 const buzz = () => { Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {}); };
 
 const fmt = (ms) => {
@@ -26,12 +39,13 @@ const fmt = (ms) => {
 };
 
 function Tile({ icon, title, sub, active, dim, live, small, onPress, onLongPress, badge, style }) {
+  const basis = useContext(ColsCtx);
   return (
     <Pressable
       onPress={() => { buzz(); onPress && onPress(); }}
       onLongPress={onLongPress}
       style={({ pressed }) => [
-        s.tile, small && s.tileSmall, active && s.tileActive, live && s.tileLive,
+        s.tile, { flexBasis: basis }, small && s.tileSmall, active && s.tileActive, live && s.tileLive,
         dim && s.tileDim, pressed && { transform: [{ scale: 0.96 }] }, style,
       ]}
     >
@@ -61,6 +75,10 @@ function Section({ title, edit, shown, onToggle, children }) {
 
 export default function App() {
   useKeepAwake();
+  const { width, height } = useWindowDimensions();
+  const land = width > height;
+  const cols = land ? (width >= 1000 ? 5 : 4) : 2;
+  const basis = `${Math.floor(100 / cols) - (cols > 2 ? 2 : 3)}%`;
   const [cfg, setCfg] = useState(null);
   const [status, setStatus] = useState({ status: 'idle' });
   const [scenes, setScenes] = useState([]);
@@ -203,9 +221,10 @@ export default function App() {
   const hasCam = cur === CAM.scene;
 
   return (
+    <ColsCtx.Provider value={basis}>
     <View style={s.root}>
-      <StatusBar style="light" />
-      <ScrollView contentContainerStyle={s.scroll}>
+      <StatusBar style="light" hidden={land} />
+      <ScrollView contentContainerStyle={[s.scroll, land && { paddingTop: 16, paddingHorizontal: 22 }]}>
         <View style={s.header}>
           <Text style={s.logo}>x<Text style={{ color: C.red2 }}>Saskizin</Text> Deck</Text>
           <View style={s.pill}>
@@ -333,22 +352,71 @@ export default function App() {
       <SettingsModal
         visible={settings} cfg={cfg} status={st}
         onClose={() => setSettings(false)}
-        onSave={async (c) => { setCfg(c); await saveCfg(c); setSettings(false); obs.connect(c); }}
+        onSave={async (c) => { setCfg(c); await saveCfg(c); setSettings(false); obs.connect(c); toast('Conectando em ' + c.host + '…'); }}
       />
     </View>
+    </ColsCtx.Provider>
+  );
+}
+
+function QrScanner({ visible, onClose, onResult }) {
+  const [perm, requestPerm] = useCameraPermissions();
+  const done = useRef(false);
+  const [msg, setMsg] = useState('');
+  useEffect(() => {
+    if (visible) { done.current = false; setMsg(''); if (perm && !perm.granted && perm.canAskAgain) requestPerm(); }
+  }, [visible, perm]);
+  return (
+    <Modal visible={visible} animationType="slide" onRequestClose={onClose} supportedOrientations={['portrait', 'landscape']}>
+      <View style={s.scanRoot}>
+        {perm && perm.granted ? (
+          <CameraView
+            style={StyleSheet.absoluteFill}
+            facing="back"
+            barcodeScannerSettings={{ barcodeTypes: ['qr'] }}
+            onBarcodeScanned={({ data }) => {
+              if (done.current) return;
+              const r = parseObsQr(data);
+              if (!r) { setMsg('Esse QR não é do OBS WebSocket'); return; }
+              done.current = true;
+              buzz();
+              onResult(r);
+            }}
+          />
+        ) : (
+          <View style={s.scanCenter}>
+            <Text style={s.scanTxt}>O app precisa da câmera para ler o QR code.</Text>
+            <Pressable style={[s.wideBtn, { marginTop: 14 }]} onPress={requestPerm}><Text style={s.wideTxt}>Permitir câmera</Text></Pressable>
+          </View>
+        )}
+        <View style={s.scanFrame} pointerEvents="none" />
+        <View style={s.scanTop}>
+          <Text style={s.scanTitle}>Aponte para o QR do OBS</Text>
+          <Text style={s.scanTxt}>No PC: Ferramentas → Configurações do servidor WebSocket → Mostrar informações de conexão</Text>
+          {msg ? <Text style={[s.scanTxt, { color: C.red2, marginTop: 6 }]}>{msg}</Text> : null}
+        </View>
+        <Pressable style={s.scanClose} onPress={onClose}><Text style={s.wideTxt}>Cancelar</Text></Pressable>
+      </View>
+    </Modal>
   );
 }
 
 function SettingsModal({ visible, cfg, status, onClose, onSave }) {
+  const [scan, setScan] = useState(false);
   const [host, setHost] = useState(cfg.host);
   const [port, setPort] = useState(String(cfg.port || 4455));
   const [pass, setPass] = useState(cfg.pass);
   useEffect(() => { if (visible) { setHost(cfg.host); setPort(String(cfg.port || 4455)); setPass(cfg.pass); } }, [visible, cfg]);
   return (
-    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose} supportedOrientations={['portrait', 'landscape']}>
       <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={s.modalBg}>
+        <ScrollView contentContainerStyle={{ flexGrow: 1, justifyContent: 'center' }} keyboardShouldPersistTaps="handled">
         <View style={s.modal}>
           <Text style={s.modalTitle}>Conexão com o OBS</Text>
+          <Pressable style={[s.wideBtn, { marginTop: 14 }]} onPress={() => { buzz(); setScan(true); }}>
+            <Text style={s.wideTxt}>📷  Conectar pelo QR code</Text>
+          </Pressable>
+          <Text style={[s.hint, { textAlign: 'center' }]}>ou preencha manualmente:</Text>
           {status === 'auth' ? <Text style={[s.label, { color: C.red2 }]}>A senha não confere. Confira em Ferramentas → Configurações do servidor WebSocket.</Text> : null}
           <Text style={s.label}>Endereço do PC (IP na rede Wi-Fi)</Text>
           <TextInput style={s.input} value={host} onChangeText={setHost} placeholder="ex.: 192.168.0.10" placeholderTextColor={C.mut} autoCapitalize="none" autoCorrect={false} keyboardType="numbers-and-punctuation" />
@@ -362,7 +430,9 @@ function SettingsModal({ visible, cfg, status, onClose, onSave }) {
             <Pressable style={[s.rowBtn, { backgroundColor: C.red }]} onPress={() => onSave({ host: host.trim(), port: parseInt(port, 10) || 4455, pass })}><Text style={s.rowTxt}>Salvar</Text></Pressable>
           </View>
         </View>
+        </ScrollView>
       </KeyboardAvoidingView>
+      <QrScanner visible={scan} onClose={() => setScan(false)} onResult={(r) => { setScan(false); setHost(r.host); setPort(String(r.port)); setPass(r.pass); onSave(r); }} />
     </Modal>
   );
 }
@@ -390,7 +460,7 @@ const s = StyleSheet.create({
   secToggleTxt: { color: C.cream, fontSize: 11, fontWeight: '700' },
   grid: { flexDirection: 'row', flexWrap: 'wrap', gap: 10 },
   camGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 10 },
-  tile: { flexBasis: '47%', flexGrow: 1, minHeight: 84, borderRadius: 16, backgroundColor: C.card, padding: 12, justifyContent: 'flex-end', gap: 3, borderWidth: 1.5, borderColor: 'transparent' },
+  tile: { flexGrow: 1, minHeight: 84, borderRadius: 16, backgroundColor: C.card, padding: 12, justifyContent: 'flex-end', gap: 3, borderWidth: 1.5, borderColor: 'transparent' },
   tileSmall: { minHeight: 62 },
   tileActive: { backgroundColor: C.red, borderColor: C.cream },
   tileLive: { backgroundColor: C.red },
@@ -415,4 +485,11 @@ const s = StyleSheet.create({
   row: { flexDirection: 'row', gap: 10, marginTop: 18 },
   rowBtn: { flex: 1, padding: 13, borderRadius: 12, alignItems: 'center' },
   rowTxt: { color: C.cream, fontWeight: '700', fontSize: 15 },
+  scanRoot: { flex: 1, backgroundColor: '#000' },
+  scanCenter: { flex: 1, alignItems: 'center', justifyContent: 'center', padding: 24 },
+  scanFrame: { position: 'absolute', alignSelf: 'center', top: '30%', width: 240, height: 240, borderWidth: 4, borderColor: C.red, borderRadius: 24 },
+  scanTop: { position: 'absolute', top: 40, left: 20, right: 20, backgroundColor: 'rgba(23,19,13,0.85)', borderRadius: 14, padding: 12 },
+  scanTitle: { color: C.cream, fontWeight: '800', fontSize: 16 },
+  scanTxt: { color: C.cream, fontSize: 12.5, marginTop: 4, textAlign: 'center' },
+  scanClose: { position: 'absolute', bottom: 40, alignSelf: 'center', backgroundColor: C.red, borderRadius: 14, paddingVertical: 14, paddingHorizontal: 40 },
 });
